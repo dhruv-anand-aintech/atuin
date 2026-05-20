@@ -535,6 +535,19 @@ The `filter_mode` setting selects the initial mode from this list. If `filter_mo
 filters = ["global", "host", "session", "directory"]
 ```
 
+### `exact_prefix_substring_sort`
+
+Default: `false`
+
+When enabled together with `smart_sort`, interactive search ranks exact command matches before prefix matches, prefix matches before substring matches, and substring matches before other fuzzy matches. The usual smart-sort score is still used inside each group.
+
+```toml
+smart_sort = true
+
+[search]
+exact_prefix_substring_sort = true
+```
+
 ### Score multipliers
 
 For the [`"daemon-fuzzy"` search mode](#search_mode), you can control the scoring of matched items. The system scores matches based on three numbers: frequency, recency, and frecency:

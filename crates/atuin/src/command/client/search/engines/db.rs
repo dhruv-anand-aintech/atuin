@@ -32,6 +32,7 @@ impl SearchEngine for Search {
                 OptFilters {
                     limit: Some(200),
                     authors: authors_for_filter_mode(state.filter_mode),
+                    rank_by_text_match: state.rank_by_text_match,
                     ..Default::default()
                 },
             )

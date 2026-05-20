@@ -253,6 +253,7 @@ impl Cmd {
                 offset: self.offset,
                 reverse: self.reverse,
                 include_duplicates: self.include_duplicates,
+                rank_by_text_match: false,
                 authors: self.author.clone().unwrap_or_default(),
             };
 

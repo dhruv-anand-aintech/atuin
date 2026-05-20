@@ -54,6 +54,7 @@ pub struct OptFilters {
     pub offset: Option<i64>,
     pub reverse: bool,
     pub include_duplicates: bool,
+    pub rank_by_text_match: bool,
     /// Author filter. Supports special values `$all-user` and `$all-agent`.
     pub authors: Vec<String>,
 }
@@ -507,7 +508,19 @@ impl Database for Sqlite {
             sql.offset(offset);
         }
 
-        if filter_options.reverse {
+        if filter_options.rank_by_text_match && !query.is_empty() {
+            let query = quote(query);
+            sql.order_asc(
+                format!(
+                    "case when command = {query} then 0 when command like {query} || '%' then 1 when instr(command, {query}) > 0 then 2 else 3 end"
+                )
+            );
+            if filter_options.include_duplicates {
+                sql.order_desc("timestamp");
+            } else {
+                sql.order_desc("max(timestamp)");
+            }
+        } else if filter_options.reverse {
             sql.order_asc("timestamp");
         } else {
             sql.order_desc("timestamp");
@@ -1028,8 +1041,16 @@ mod test {
     }
 
     async fn new_history_item(db: &mut impl Database, cmd: &str) -> Result<()> {
+        new_history_item_at(db, cmd, OffsetDateTime::now_utc()).await
+    }
+
+    async fn new_history_item_at(
+        db: &mut impl Database,
+        cmd: &str,
+        timestamp: OffsetDateTime,
+    ) -> Result<()> {
         let mut captured: History = History::capture()
-            .timestamp(OffsetDateTime::now_utc())
+            .timestamp(timestamp)
             .command(cmd)
             .cwd("/home/ellie")
             .build()
@@ -1041,6 +1062,48 @@ mod test {
         captured.hostname = "booop".to_string();
 
         db.save(&captured).await
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_search_rank_by_text_match_before_limit() {
+        let mut db = Sqlite::new("sqlite::memory:", test_local_timeout())
+            .await
+            .unwrap();
+        let now = OffsetDateTime::now_utc();
+        new_history_item_at(&mut db, "echo claude ", now)
+            .await
+            .unwrap();
+        new_history_item_at(
+            &mut db,
+            "claude --dangerously-skip-permissions",
+            now - time::Duration::days(1),
+        )
+        .await
+        .unwrap();
+
+        let results = db
+            .search(
+                SearchMode::FullText,
+                FilterMode::Global,
+                &Context {
+                    hostname: "test:host".to_string(),
+                    session: "beepboopiamasession".to_string(),
+                    cwd: "/home/ellie".to_string(),
+                    host_id: "test-host".to_string(),
+                    git_root: None,
+                },
+                "claude ",
+                OptFilters {
+                    limit: Some(1),
+                    rank_by_text_match: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let commands: Vec<&str> = results.iter().map(|a| a.command.as_str()).collect();
+        assert_eq!(commands, vec!["claude --dangerously-skip-permissions"]);
     }
 
     #[tokio::test(flavor = "multi_thread")]

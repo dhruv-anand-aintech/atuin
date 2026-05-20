@@ -56,7 +56,6 @@ use ratatui::crossterm::event::{
 use windows_sys::Win32::System::Console::{GetConsoleOutputCP, SetConsoleOutputCP};
 
 const TAB_TITLES: [&str; 2] = ["Search", "Inspect"];
-
 pub enum InputAction {
     Accept(usize),
     AcceptInspecting,
@@ -156,7 +155,7 @@ impl State {
     async fn query_results(
         &mut self,
         db: &mut dyn Database,
-        smart_sort: bool,
+        settings: &Settings,
     ) -> Result<Vec<History>> {
         let results = self.engine.query(&self.search, db).await?;
 
@@ -168,10 +167,11 @@ impl State {
         self.results_state.select(0);
         self.results_len = results.len();
 
-        if smart_sort {
-            Ok(atuin_history::sort::sort(
+        if settings.smart_sort {
+            Ok(atuin_history::sort::sort_with_match_ranking(
                 self.search.input.as_str(),
                 results,
+                settings.search.exact_prefix_substring_sort,
             ))
         } else {
             Ok(results)
@@ -1770,6 +1770,7 @@ pub async fn history(
             filter_mode: default_filter_mode,
             context: initial_context.clone(),
             custom_context: None,
+            rank_by_text_match: settings.smart_sort && settings.search.exact_prefix_substring_sort,
         },
         engine: engines::engine(search_mode, settings),
         results_len: 0,
@@ -1792,7 +1793,7 @@ pub async fn history(
 
     app.initialize_keymap_cursor(settings);
 
-    let mut results = app.query_results(&mut db, settings.smart_sort).await?;
+    let mut results = app.query_results(&mut db, settings).await?;
 
     if inline_height > 0 && !popup_mode {
         terminal.clear()?;
@@ -1915,7 +1916,7 @@ pub async fn history(
             || initial_search_mode != app.search_mode
             || initial_custom_context != app.search.custom_context
         {
-            results = app.query_results(&mut db, settings.smart_sort).await?;
+            results = app.query_results(&mut db, settings).await?;
         }
 
         // In custom context mode, when no filter is applied, highlight the entry which was used
@@ -2261,6 +2262,7 @@ mod tests {
                     git_root: None,
                 },
                 custom_context: None,
+                rank_by_text_match: false,
             },
             engine: engines::engine(SearchMode::Fuzzy, &settings),
             now: Box::new(OffsetDateTime::now_utc),
@@ -2316,6 +2318,7 @@ mod tests {
                     git_root: None,
                 },
                 custom_context: None,
+                rank_by_text_match: false,
             },
             engine: engines::engine(SearchMode::Fuzzy, &settings),
             now: Box::new(OffsetDateTime::now_utc),
@@ -2435,6 +2438,7 @@ mod tests {
                     git_root: None,
                 },
                 custom_context: None,
+                rank_by_text_match: false,
             },
             engine: engines::engine(SearchMode::Fuzzy, &settings),
             now: Box::new(OffsetDateTime::now_utc),
@@ -2494,6 +2498,7 @@ mod tests {
                     git_root: None,
                 },
                 custom_context: None,
+                rank_by_text_match: false,
             },
             engine: engines::engine(SearchMode::Fuzzy, &settings),
             now: Box::new(OffsetDateTime::now_utc),
@@ -2549,6 +2554,7 @@ mod tests {
                     git_root: None,
                 },
                 custom_context: None,
+                rank_by_text_match: false,
             },
             engine: engines::engine(SearchMode::Fuzzy, &settings),
             now: Box::new(OffsetDateTime::now_utc),
@@ -2600,6 +2606,7 @@ mod tests {
                     git_root: None,
                 },
                 custom_context: None,
+                rank_by_text_match: false,
             },
             engine: engines::engine(SearchMode::Fuzzy, &settings),
             now: Box::new(OffsetDateTime::now_utc),
@@ -2660,6 +2667,7 @@ mod tests {
                     git_root: None,
                 },
                 custom_context: None,
+                rank_by_text_match: false,
             },
             engine: engines::engine(SearchMode::Fuzzy, &settings),
             now: Box::new(OffsetDateTime::now_utc),
@@ -2721,6 +2729,7 @@ mod tests {
                     git_root: None,
                 },
                 custom_context: None,
+                rank_by_text_match: false,
             },
             engine: engines::engine(SearchMode::Fuzzy, &settings),
             now: Box::new(OffsetDateTime::now_utc),
@@ -3100,6 +3109,7 @@ mod tests {
                     git_root: None,
                 },
                 custom_context: None,
+                rank_by_text_match: false,
             },
             engine: engines::engine(SearchMode::Fuzzy, &settings),
             now: Box::new(OffsetDateTime::now_utc),

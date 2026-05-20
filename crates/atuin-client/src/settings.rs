@@ -558,6 +558,9 @@ pub struct Search {
     /// The list of enabled filter modes, in order of priority.
     pub filters: Vec<FilterMode>,
 
+    /// Rank smart-sorted interactive search results by exact, prefix, substring, then other fuzzy matches.
+    pub exact_prefix_substring_sort: bool,
+
     /// The recency score multiplier for the search index (default: 1.0).
     /// Values < 1.0 reduce weight, > 1.0 increase weight, 0.0 disables.
     pub recency_score_multiplier: f64,
@@ -856,6 +859,7 @@ impl Default for Search {
                 FilterMode::Agent,
             ],
 
+            exact_prefix_substring_sort: false,
             recency_score_multiplier: 1.0,
             frequency_score_multiplier: 1.0,
             frecency_score_multiplier: 1.0,
@@ -1562,6 +1566,7 @@ impl Settings {
             .set_default("logs.ai.file", "ai.log")?
             .set_default("kv.db_path", kv_path.to_str())?
             .set_default("scripts.db_path", scripts_path.to_str())?
+            .set_default("search.exact_prefix_substring_sort", false)?
             .set_default("search.recency_score_multiplier", 1.0)?
             .set_default("search.frequency_score_multiplier", 1.0)?
             .set_default("search.frecency_score_multiplier", 1.0)?

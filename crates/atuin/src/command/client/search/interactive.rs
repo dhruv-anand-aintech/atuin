@@ -1240,43 +1240,66 @@ impl State {
         theme: &Theme,
     ) -> Paragraph<'_> {
         let selected = self.results_state.selected();
-        let command = if results.is_empty() {
+        let preview = if results.is_empty() {
             String::new()
         } else {
-            let s = &results[selected].command;
-            let mut lines = Vec::new();
-            for line in s.split('\n') {
-                let line = line.escape_control();
-                let mut width = 0;
-                let mut start = 0;
-                for (idx, ch) in line.char_indices() {
-                    let w = ch.width().unwrap_or(0); // None for control chars which should not happen
-                    if width + w > preview_width.into() {
-                        lines.push(line[start..idx].to_owned());
-                        start = idx;
-                        width = w;
-                    } else {
-                        width += w;
-                    }
-                }
-                if width != 0 {
-                    lines.push(line[start..].to_owned());
-                }
-            }
-            lines.join("\n")
+            let history = &results[selected];
+            preview_text(history, preview_width)
         };
 
         match compactness {
-            Compactness::Full => Paragraph::new(command).block(
+            Compactness::Full => Paragraph::new(preview).block(
                 Block::default()
                     .borders(Borders::BOTTOM | Borders::LEFT | Borders::RIGHT)
                     .border_type(BorderType::Rounded)
                     .title(format!("{:─>width$}", "", width = chunk_width - 2)),
             ),
-            _ => Paragraph::new(command)
+            _ => Paragraph::new(preview)
                 .style(Style::from_crossterm(theme.as_style(Meaning::Annotation))),
         }
     }
+}
+
+fn display_author(history: &History) -> &str {
+    let author = history.author.trim();
+    let self_author = history
+        .hostname
+        .split_once(':')
+        .map_or(history.hostname.as_str(), |(_, user)| user);
+
+    if author.is_empty() || author == self_author {
+        return "self";
+    }
+
+    match author {
+        "claude-code" => "claude",
+        agent => agent,
+    }
+}
+
+fn preview_text(history: &History, preview_width: u16) -> String {
+    let author = display_author(history);
+    let preview = format!("[author: {author}] {}", history.command);
+    let mut lines = Vec::new();
+    for line in preview.split('\n') {
+        let line = line.escape_control();
+        let mut width = 0;
+        let mut start = 0;
+        for (idx, ch) in line.char_indices() {
+            let w = ch.width().unwrap_or(0); // None for control chars which should not happen
+            if width + w > preview_width.into() {
+                lines.push(line[start..idx].to_owned());
+                start = idx;
+                width = w;
+            } else {
+                width += w;
+            }
+        }
+        if width != 0 {
+            lines.push(line[start..].to_owned());
+        }
+    }
+    lines.join("\n")
 }
 
 /// The writer used for terminal output - either stdout or /dev/tty
@@ -2077,7 +2100,44 @@ mod tests {
     use crate::command::client::search::engines::{self, SearchState};
     use crate::command::client::search::history_list::ListState;
 
-    use super::{Compactness, InspectingState, KeymapSet, State};
+    use super::{Compactness, InspectingState, KeymapSet, State, display_author, preview_text};
+
+    fn history_with_author(author: &str) -> History {
+        History::import()
+            .timestamp(time::OffsetDateTime::now_utc())
+            .command("echo hi")
+            .cwd("/")
+            .hostname("host:dhruv".to_string())
+            .author(author.to_string())
+            .build()
+            .into()
+    }
+
+    #[test]
+    fn display_author_labels_selected_command_author() {
+        assert_eq!(display_author(&history_with_author("dhruv")), "self");
+        assert_eq!(
+            display_author(&history_with_author("claude-code")),
+            "claude"
+        );
+        assert_eq!(display_author(&history_with_author("codex")), "codex");
+        assert_eq!(display_author(&history_with_author("cursor")), "cursor");
+        assert_eq!(display_author(&history_with_author("opencode")), "opencode");
+        assert_eq!(display_author(&history_with_author("pi")), "pi");
+    }
+
+    #[test]
+    fn preview_text_includes_selected_command_author() {
+        let history = History::capture()
+            .timestamp(time::OffsetDateTime::now_utc())
+            .command("cargo test")
+            .cwd("/")
+            .author("codex".to_string())
+            .build()
+            .into();
+
+        assert_eq!(preview_text(&history, 80), "[author: codex] cargo test");
+    }
 
     #[test]
     #[allow(clippy::too_many_lines)]

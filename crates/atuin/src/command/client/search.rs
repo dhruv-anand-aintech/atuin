@@ -17,6 +17,8 @@ use atuin_client::{
 
 use super::history::ListMode;
 
+use atuin_history::sort::sort as smart_sort;
+
 mod cursor;
 mod duration;
 mod engines;
@@ -280,6 +282,10 @@ impl Cmd {
                         run_non_interactive(settings, opt_filter.clone(), &query, &db).await?;
                 }
             } else {
+                if settings.smart_sort && !query.is_empty() {
+                    entries = smart_sort(query.join(" ").as_str(), entries);
+                }
+
                 let format = match self.format {
                     None => Some(settings.history_format.as_str()),
                     _ => self.format.as_deref(),

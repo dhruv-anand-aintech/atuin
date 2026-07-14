@@ -4,8 +4,8 @@ use atuin_client::{
     database::Database,
     database::OptFilters,
     database::{QueryToken, QueryTokenizer},
-    history::{AUTHOR_FILTER_ALL_USER, History},
-    settings::SearchMode,
+    history::{AUTHOR_FILTER_ALL_AGENT, AUTHOR_FILTER_ALL_USER, History},
+    settings::{FilterMode, SearchMode},
 };
 use eyre::Result;
 use norm::Metric;
@@ -31,7 +31,7 @@ impl SearchEngine for Search {
                 state.input.as_str(),
                 OptFilters {
                     limit: Some(200),
-                    authors: vec![AUTHOR_FILTER_ALL_USER.to_string()],
+                    authors: authors_for_state(state),
                     ..Default::default()
                 },
             )
@@ -56,6 +56,57 @@ impl SearchEngine for Search {
 
         // convert ranges to all indices
         ranges.into_iter().flatten().collect()
+    }
+}
+
+pub(crate) fn authors_for_filter_mode(filter_mode: FilterMode) -> Vec<String> {
+    if filter_mode == FilterMode::Agent {
+        vec![AUTHOR_FILTER_ALL_AGENT.to_string()]
+    } else {
+        vec![AUTHOR_FILTER_ALL_USER.to_string()]
+    }
+}
+
+pub(crate) fn authors_for_state(state: &SearchState) -> Vec<String> {
+    if state.include_all_authors && state.filter_mode != FilterMode::Agent {
+        Vec::new()
+    } else {
+        authors_for_filter_mode(state.filter_mode)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use atuin_client::{database::Context, history::HistoryId};
+
+    fn state(filter_mode: FilterMode, include_all_authors: bool) -> SearchState {
+        SearchState {
+            input: String::new().into(),
+            filter_mode,
+            context: Context {
+                session: String::new(),
+                cwd: String::new(),
+                hostname: String::new(),
+                host_id: String::new(),
+                git_root: None,
+            },
+            custom_context: None::<HistoryId>,
+            include_all_authors,
+        }
+    }
+
+    #[test]
+    fn shell_up_author_filter_includes_user_and_agent_history() {
+        assert_eq!(
+            authors_for_state(&state(FilterMode::Global, false)),
+            vec![AUTHOR_FILTER_ALL_USER.to_string()]
+        );
+        assert!(authors_for_state(&state(FilterMode::Global, true)).is_empty());
+        assert_eq!(
+            authors_for_state(&state(FilterMode::Agent, true)),
+            vec![AUTHOR_FILTER_ALL_AGENT.to_string()]
+        );
     }
 }
 

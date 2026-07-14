@@ -147,8 +147,9 @@ _atuin_search_viins() {
 }
 
 _atuin_up_search() {
-    # Only trigger if the buffer is a single line
-    if [[ ! $BUFFER == *$'\n'* ]]; then
+    # Move within multiline buffers until the cursor reaches the first line,
+    # then resume searching older history entries.
+    if [[ $BUFFER != *$'\n'* || $LBUFFER != *$'\n'* ]]; then
         _atuin_search --shell-up-key-binding "$@"
     else
         zle up-line

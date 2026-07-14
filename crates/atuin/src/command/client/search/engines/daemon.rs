@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use atuin_client::{
     database::{Database, OptFilters},
-    history::{AUTHOR_FILTER_ALL_USER, History},
+    history::History,
     settings::{SearchMode, Settings},
 };
 use atuin_daemon::client::{DaemonClientErrorKind, SearchClient, classify_error};
@@ -86,13 +86,13 @@ impl Search {
     ) -> Result<Vec<History>> {
         let results = db
             .search(
-                SearchMode::FullText,
+                SearchMode::Fuzzy,
                 state.filter_mode,
                 &state.context,
                 state.input.as_str(),
                 OptFilters {
                     limit: Some(200),
-                    authors: vec![AUTHOR_FILTER_ALL_USER.to_string()],
+                    authors: super::db::authors_for_state(state),
                     ..Default::default()
                 },
             )
@@ -121,6 +121,11 @@ impl SearchEngine for Search {
         db: &mut dyn Database,
     ) -> Result<Vec<History>> {
         let query = state.input.as_str().to_string();
+
+        if state.filter_mode == atuin_client::settings::FilterMode::Agent {
+            debug!(query = %query, "[daemon-client] agent filter detected, falling back to db");
+            return self.fallback_to_db_search(state, db).await;
+        }
 
         // Fall back to database for regex queries (Nucleo doesn't support regex)
         if Self::contains_regex_pattern(&query) {

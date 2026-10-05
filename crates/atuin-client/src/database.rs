@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     env,
     path::{Path, PathBuf},
     str::FromStr,
@@ -32,6 +33,14 @@ use super::{
     ordering,
     settings::{FilterMode, SearchMode, Settings},
 };
+
+/// When de-duplicating command entries in Rust, fetch this many rows per requested
+/// unique command. A recency-ordered scan terminates early, so this stays cheap.
+const DEDUP_OVERFETCH: i64 = 20;
+
+/// Hard cap on rows fetched by the Rust de-duplication path. Requests whose
+/// over-fetched window would exceed this fall back to the SQL `GROUP BY` path.
+const DEDUP_FETCH_CAP: i64 = 6000;
 
 #[derive(Clone)]
 pub struct Context {
@@ -161,6 +170,14 @@ fn fuzzy_prefix_query(query: &str) -> Option<String> {
     }
 
     (!parts.is_empty()).then(|| parts.join(" "))
+}
+
+/// When de-duplicating in Rust with a bounded limit, run prefix-friendly fuzzy search
+/// in two SQL passes so prefix matches are not drowned out by newer substring hits.
+enum FuzzyPrefixSearchPass<'a> {
+    Standard,
+    PrefixFirst { prefix: &'a str },
+    FuzzyFill { prefix: &'a str },
 }
 
 #[async_trait]
@@ -529,171 +546,268 @@ impl Database for Sqlite {
         query: &str,
         filter_options: OptFilters,
     ) -> Result<Vec<History>> {
-        let mut sql = SqlBuilder::select_from("history");
-
-        if !filter_options.include_duplicates {
-            sql.group_by("command").having("max(timestamp)");
-        }
-
-        if let Some(limit) = filter_options.limit {
-            sql.limit(limit);
-        }
-
-        if let Some(offset) = filter_options.offset {
-            sql.offset(offset);
-        }
-
-        if search_mode == SearchMode::Fuzzy
-            && let Some(order) = fuzzy_prefix_order(query)
-        {
-            sql.order_by(order, false);
-            if filter_options.reverse {
-                sql.order_asc("max(timestamp)");
-            } else {
-                sql.order_desc("max(timestamp)");
-            }
-        } else if filter_options.reverse {
-            sql.order_asc("timestamp");
-        } else {
-            sql.order_desc("timestamp");
-        }
-
-        let git_root = if let Some(git_root) = context.git_root.clone() {
-            git_root.to_str().unwrap_or("/").to_string()
-        } else {
-            context.cwd.clone()
-        };
-
-        let session_start = get_session_start_time(&context.session);
-
-        match filter {
-            FilterMode::Global => &mut sql,
-            FilterMode::Host => {
-                sql.and_where_eq("lower(hostname)", quote(context.hostname.to_lowercase()))
-            }
-            FilterMode::Session => sql.and_where_eq("session", quote(&context.session)),
-            FilterMode::SessionPreload => {
-                sql.and_where_eq("session", quote(&context.session));
-                if let Some(session_start) = session_start {
-                    sql.or_where_lt("timestamp", session_start);
-                }
-                &mut sql
-            }
-            FilterMode::Directory => sql.and_where_eq("cwd", quote(&context.cwd)),
-            FilterMode::Workspace => sql.and_where_like_left("cwd", git_root),
-            FilterMode::Agent => {
-                apply_author_filter(&mut sql, &[AUTHOR_FILTER_ALL_AGENT.to_string()]);
-                &mut sql
-            }
-        };
-
         let orig_query = query;
 
-        let mut regexes = Vec::new();
-        match search_mode {
-            SearchMode::Prefix => sql.and_where_like_left("command", query.replace('*', "%")),
-            _ => {
-                let mut is_or = false;
-                for token in QueryTokenizer::new(query) {
-                    // TODO smart case mode could be made configurable like in fzf
-                    let (is_glob, glob) = if token.has_uppercase() {
-                        (true, "*")
-                    } else {
-                        (false, "%")
-                    };
-                    let param = match token {
-                        QueryToken::Regex(r) => {
-                            regexes.push(String::from(r));
-                            continue;
-                        }
-                        QueryToken::Or => {
-                            if !is_or {
-                                is_or = true;
-                                continue;
-                            } else {
-                                format!("{glob}|{glob}")
-                            }
-                        }
-                        QueryToken::MatchStart(term, _) => {
-                            format!("{term}{glob}")
-                        }
-                        QueryToken::MatchEnd(term, _) => {
-                            format!("{glob}{term}")
-                        }
-                        QueryToken::MatchFull(term, _) => {
-                            format!("{glob}{term}{glob}")
-                        }
-                        QueryToken::Match(term, _) => {
-                            if search_mode == SearchMode::FullText {
-                                format!("{glob}{term}{glob}")
-                            } else {
-                                term.split("").join(glob)
-                            }
-                        }
-                    };
+        // Historically, de-duplicating command entries used
+        // `GROUP BY command ... ORDER BY max(timestamp)`, which forces SQLite to
+        // materialize and sort *every* matching group before it can apply the LIMIT.
+        // On large histories (100k+ rows, ~95k distinct commands) that dominates search
+        // latency: a fuzzy query took ~190ms and even an empty query ~195ms, because the
+        // fuzzy/substring predicate cannot use an index and the group-by must still scan
+        // all matches.
+        //
+        // When the caller bounds the result set, instead fetch the most recent matching
+        // rows in recency order (which SQLite can satisfy with an index range scan and
+        // early termination) and de-duplicate by command in Rust. This makes the cost
+        // O(fetch_limit) instead of O(total matches).
+        let dedup_in_rust = !filter_options.include_duplicates
+            && filter_options.offset.is_none()
+            && filter_options.limit.is_some_and(|limit| {
+                limit > 0 && limit.saturating_mul(DEDUP_OVERFETCH) <= DEDUP_FETCH_CAP
+            });
 
-                    sql.fuzzy_condition("command", param, token.is_inverse(), is_glob, is_or);
-                    is_or = false;
-                }
-
-                &mut sql
-            }
+        let fuzzy_prefix = fuzzy_prefix_query(query);
+        let fuzzy_prefix_passes: Vec<FuzzyPrefixSearchPass<'_>> = match (
+            dedup_in_rust,
+            search_mode,
+            fuzzy_prefix.as_deref(),
+        ) {
+            (true, SearchMode::Fuzzy, Some(prefix)) => vec![
+                FuzzyPrefixSearchPass::PrefixFirst { prefix },
+                FuzzyPrefixSearchPass::FuzzyFill { prefix },
+            ],
+            _ => vec![FuzzyPrefixSearchPass::Standard],
         };
 
-        for regex in regexes {
-            sql.and_where("command regexp ?".bind(&regex));
+        let user_limit = filter_options.limit;
+        let mut combined = Vec::new();
+        let mut seen_commands = HashSet::new();
+
+        for pass in fuzzy_prefix_passes {
+            if user_limit.is_some_and(|limit| combined.len() >= limit as usize) {
+                break;
+            }
+
+            let pass_limit = user_limit.map(|limit| limit - combined.len() as i64);
+
+            let mut sql = SqlBuilder::select_from("history");
+
+            if !filter_options.include_duplicates && !dedup_in_rust {
+                sql.group_by("command").having("max(timestamp)");
+            }
+
+            // Over-fetch so de-duplication still yields the requested number of unique
+            // commands. The recency-ordered scan stops early, so this stays cheap.
+            let sql_limit = if dedup_in_rust {
+                pass_limit.map(|limit| limit.saturating_mul(DEDUP_OVERFETCH))
+            } else {
+                pass_limit
+            };
+
+            if let Some(limit) = sql_limit {
+                sql.limit(limit);
+            }
+
+            if let Some(offset) = filter_options.offset {
+                sql.offset(offset);
+            }
+
+            // A recency scan cannot order by `max(timestamp)` (that needs the group-by), so
+            // prefix/contains ranking is applied by `reorder_fuzzy` below instead. Keep the
+            // historical ordering for the group-by path.
+            if !dedup_in_rust
+                && search_mode == SearchMode::Fuzzy
+                && let Some(order) = fuzzy_prefix_order(query)
+            {
+                sql.order_by(order, false);
+                if filter_options.reverse {
+                    sql.order_asc("max(timestamp)");
+                } else {
+                    sql.order_desc("max(timestamp)");
+                }
+            } else if filter_options.reverse {
+                sql.order_asc("timestamp");
+            } else {
+                sql.order_desc("timestamp");
+            }
+
+            let git_root = if let Some(git_root) = context.git_root.clone() {
+                git_root.to_str().unwrap_or("/").to_string()
+            } else {
+                context.cwd.clone()
+            };
+
+            let session_start = get_session_start_time(&context.session);
+
+            match filter {
+                FilterMode::Global => &mut sql,
+                FilterMode::Host => {
+                    sql.and_where_eq("lower(hostname)", quote(context.hostname.to_lowercase()))
+                }
+                FilterMode::Session => sql.and_where_eq("session", quote(&context.session)),
+                FilterMode::SessionPreload => {
+                    sql.and_where_eq("session", quote(&context.session));
+                    if let Some(session_start) = session_start {
+                        sql.or_where_lt("timestamp", session_start);
+                    }
+                    &mut sql
+                }
+                FilterMode::Directory => sql.and_where_eq("cwd", quote(&context.cwd)),
+                FilterMode::Workspace => sql.and_where_like_left("cwd", git_root),
+                FilterMode::Agent => {
+                    apply_author_filter(&mut sql, &[AUTHOR_FILTER_ALL_AGENT.to_string()]);
+                    &mut sql
+                }
+            };
+
+            let mut regexes = Vec::new();
+            match pass {
+                FuzzyPrefixSearchPass::PrefixFirst { prefix } => {
+                    sql.and_where_like_left("command", prefix);
+                    &mut sql
+                }
+                FuzzyPrefixSearchPass::Standard | FuzzyPrefixSearchPass::FuzzyFill { .. } => {
+                    match search_mode {
+                        SearchMode::Prefix => {
+                            sql.and_where_like_left("command", query.replace('*', "%"))
+                        }
+                        _ => {
+                            let mut is_or = false;
+                            for token in QueryTokenizer::new(query) {
+                                // TODO smart case mode could be made configurable like in fzf
+                                let (is_glob, glob) = if token.has_uppercase() {
+                                    (true, "*")
+                                } else {
+                                    (false, "%")
+                                };
+                                let param = match token {
+                                    QueryToken::Regex(r) => {
+                                        regexes.push(String::from(r));
+                                        continue;
+                                    }
+                                    QueryToken::Or => {
+                                        if !is_or {
+                                            is_or = true;
+                                            continue;
+                                        } else {
+                                            format!("{glob}|{glob}")
+                                        }
+                                    }
+                                    QueryToken::MatchStart(term, _) => {
+                                        format!("{term}{glob}")
+                                    }
+                                    QueryToken::MatchEnd(term, _) => {
+                                        format!("{glob}{term}")
+                                    }
+                                    QueryToken::MatchFull(term, _) => {
+                                        format!("{glob}{term}{glob}")
+                                    }
+                                    QueryToken::Match(term, _) => {
+                                        if search_mode == SearchMode::FullText {
+                                            format!("{glob}{term}{glob}")
+                                        } else {
+                                            term.split("").join(glob)
+                                        }
+                                    }
+                                };
+
+                                sql.fuzzy_condition(
+                                    "command",
+                                    param,
+                                    token.is_inverse(),
+                                    is_glob,
+                                    is_or,
+                                );
+                                is_or = false;
+                            }
+
+                            &mut sql
+                        }
+                    }
+                }
+            };
+
+            if let FuzzyPrefixSearchPass::FuzzyFill { prefix } = pass {
+                let prefix_pattern = quote(format!("{prefix}%"));
+                sql.and_where(format!("command NOT LIKE {prefix_pattern}"));
+            }
+
+            for regex in regexes {
+                sql.and_where("command regexp ?".bind(&regex));
+            }
+
+            filter_options
+                .exit
+                .map(|exit| sql.and_where_eq("exit", exit));
+
+            filter_options
+                .exclude_exit
+                .map(|exclude_exit| sql.and_where_ne("exit", exclude_exit));
+
+            if let Some(cwd) = filter_options.cwd.as_ref() {
+                sql.and_where_eq("cwd", quote(cwd));
+            }
+
+            if let Some(exclude_cwd) = filter_options.exclude_cwd.as_ref() {
+                sql.and_where_ne("cwd", quote(exclude_cwd));
+            }
+
+            if let Some(before) = filter_options.before.as_ref() {
+                if let Ok(before) = interim::parse_date_string(
+                    before.as_str(),
+                    OffsetDateTime::now_utc(),
+                    interim::Dialect::Uk,
+                ) {
+                    sql.and_where_lt("timestamp", quote(before.unix_timestamp_nanos() as i64));
+                }
+            }
+
+            if let Some(after) = filter_options.after.as_ref() {
+                if let Ok(after) = interim::parse_date_string(
+                    after.as_str(),
+                    OffsetDateTime::now_utc(),
+                    interim::Dialect::Uk,
+                ) {
+                    sql.and_where_gt("timestamp", quote(after.unix_timestamp_nanos() as i64));
+                }
+            }
+
+            if !filter_options.authors.is_empty() {
+                apply_author_filter(&mut sql, &filter_options.authors);
+            }
+
+            sql.and_where_is_null("deleted_at");
+
+            let query = sql.sql().expect("bug in search query. please report");
+
+            let mut res = sqlx::query(&query)
+                .map(Self::query_history)
+                .fetch_all(&self.pool)
+                .await?;
+
+            if dedup_in_rust {
+                // Rows arrive most-recent-first (or oldest-first when `reverse`), so keeping
+                // the first occurrence of each command retains the newest (resp. oldest)
+                // entry, matching the previous `max(timestamp)` group-by semantics.
+                let mut seen = HashSet::with_capacity(res.len());
+                res.retain(|h| seen.insert(h.command.clone()));
+
+                if let Some(limit) = pass_limit {
+                    res.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
+                }
+            }
+
+            for h in res {
+                if seen_commands.insert(h.command.clone()) {
+                    combined.push(h);
+                    if user_limit.is_some_and(|limit| combined.len() >= limit as usize) {
+                        break;
+                    }
+                }
+            }
         }
 
-        filter_options
-            .exit
-            .map(|exit| sql.and_where_eq("exit", exit));
-
-        filter_options
-            .exclude_exit
-            .map(|exclude_exit| sql.and_where_ne("exit", exclude_exit));
-
-        filter_options
-            .cwd
-            .map(|cwd| sql.and_where_eq("cwd", quote(cwd)));
-
-        filter_options
-            .exclude_cwd
-            .map(|exclude_cwd| sql.and_where_ne("cwd", quote(exclude_cwd)));
-
-        filter_options.before.map(|before| {
-            interim::parse_date_string(
-                before.as_str(),
-                OffsetDateTime::now_utc(),
-                interim::Dialect::Uk,
-            )
-            .map(|before| {
-                sql.and_where_lt("timestamp", quote(before.unix_timestamp_nanos() as i64))
-            })
-        });
-
-        filter_options.after.map(|after| {
-            interim::parse_date_string(
-                after.as_str(),
-                OffsetDateTime::now_utc(),
-                interim::Dialect::Uk,
-            )
-            .map(|after| sql.and_where_gt("timestamp", quote(after.unix_timestamp_nanos() as i64)))
-        });
-
-        if !filter_options.authors.is_empty() {
-            apply_author_filter(&mut sql, &filter_options.authors);
-        }
-
-        sql.and_where_is_null("deleted_at");
-
-        let query = sql.sql().expect("bug in search query. please report");
-
-        let res = sqlx::query(&query)
-            .map(Self::query_history)
-            .fetch_all(&self.pool)
-            .await?;
-
-        Ok(ordering::reorder_fuzzy(search_mode, orig_query, res))
+        Ok(ordering::reorder_fuzzy(search_mode, orig_query, combined))
     }
 
     async fn query_history(&self, query: &str) -> Result<Vec<History>> {
@@ -1115,6 +1229,82 @@ mod test {
         assert_search_eq(&db, SearchMode::Prefix, FilterMode::Global, "ls  ", 0)
             .await
             .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_search_dedups_recent_with_limit() {
+        let mut db = Sqlite::new("sqlite::memory:", test_local_timeout())
+            .await
+            .unwrap();
+
+        let now = OffsetDateTime::now_utc();
+        // Duplicate commands at different times; the newest occurrence should win.
+        new_history_item_at(&mut db, "git status", now - time::Duration::days(3))
+            .await
+            .unwrap();
+        new_history_item_at(&mut db, "git status", now - time::Duration::days(1))
+            .await
+            .unwrap();
+        new_history_item_at(&mut db, "git status", now)
+            .await
+            .unwrap();
+        new_history_item_at(&mut db, "git log", now - time::Duration::days(2))
+            .await
+            .unwrap();
+
+        let context = Context {
+            hostname: "test:host".to_string(),
+            session: "beepboopiamasession".to_string(),
+            cwd: "/home/ellie".to_string(),
+            host_id: "test-host".to_string(),
+            git_root: None,
+        };
+
+        let results = db
+            .search(
+                SearchMode::Prefix,
+                FilterMode::Global,
+                &context,
+                "git",
+                OptFilters {
+                    limit: Some(10),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let commands: Vec<&str> = results.iter().map(|h| h.command.as_str()).collect();
+        // Duplicates collapse to a single entry.
+        assert_eq!(commands.len(), 2, "commands: {commands:?}");
+        assert!(commands.contains(&"git status"));
+        assert!(commands.contains(&"git log"));
+
+        // The retained row is the most recent occurrence of the command.
+        let status = results
+            .iter()
+            .find(|h| h.command == "git status")
+            .expect("git status present");
+        assert_eq!(
+            status.timestamp.unix_timestamp_nanos(),
+            now.unix_timestamp_nanos()
+        );
+
+        // The limit is still honoured after de-duplication.
+        let limited = db
+            .search(
+                SearchMode::Prefix,
+                FilterMode::Global,
+                &context,
+                "git",
+                OptFilters {
+                    limit: Some(1),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(limited.len(), 1);
     }
 
     #[tokio::test(flavor = "multi_thread")]

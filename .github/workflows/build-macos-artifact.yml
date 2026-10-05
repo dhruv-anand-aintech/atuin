@@ -1,0 +1,51 @@
+name: Build macOS binary
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "crates/**"
+      - "atuin/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - ".github/workflows/build-macos-artifact.yml"
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-macos:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.95.0
+
+      - uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: macos-14-cargo-release-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build atuin CLI
+        run: cargo build -p atuin --locked --release
+
+      - name: Package binary
+        run: |
+          mkdir -p dist
+          cp target/release/atuin dist/atuin
+          shasum -a 256 dist/atuin > dist/atuin.sha256
+          atuin --version > dist/version.txt || true
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: atuin-macos-aarch64
+          path: dist/

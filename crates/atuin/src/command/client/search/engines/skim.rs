@@ -76,8 +76,15 @@ async fn fuzzy_search(
         if i % 256 == 0 {
             yield_now().await;
         }
-        if is_known_agent(&history.author) {
-            continue;
+        if !state.include_all_authors {
+            let is_agent = history.author.split(',').any(is_known_agent);
+            if state.filter_mode == FilterMode::Agent {
+                if !is_agent {
+                    continue;
+                }
+            } else if is_agent {
+                continue;
+            }
         }
         let context = &state.context;
         let git_root = context
@@ -87,6 +94,7 @@ async fn fuzzy_search(
             .unwrap_or(&context.cwd);
         match state.filter_mode {
             FilterMode::Global => {}
+            FilterMode::Agent => {}
             // we aggregate host by ',' separating them
             FilterMode::Host
                 if history

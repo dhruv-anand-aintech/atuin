@@ -16,8 +16,8 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  build-macos:
-    runs-on: macos-latest
+  build-macos-aarch64:
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
 
@@ -25,6 +25,17 @@ jobs:
         uses: dtolnay/rust-toolchain@master
         with:
           toolchain: 1.95.0
+          targets: aarch64-apple-darwin
+
+      - name: Install Zig
+        uses: goto-bus-stop/setup-zig@v2
+        with:
+          version: 0.14.0
+
+      - name: Install cargo-zigbuild
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-zigbuild
 
       - uses: actions/cache@v5
         with:
@@ -32,17 +43,17 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: macos-14-cargo-release-${{ hashFiles('**/Cargo.lock') }}
+          key: ubuntu-zig-aarch64-apple-darwin-${{ hashFiles('**/Cargo.lock') }}
 
-      - name: Build atuin CLI
-        run: cargo build -p atuin --locked --release
+      - name: Build atuin for Apple Silicon macOS
+        run: cargo zigbuild -p atuin --locked --release --target aarch64-apple-darwin
 
       - name: Package binary
         run: |
           mkdir -p dist
-          cp target/release/atuin dist/atuin
+          cp target/aarch64-apple-darwin/release/atuin dist/atuin
           shasum -a 256 dist/atuin > dist/atuin.sha256
-          atuin --version > dist/version.txt || true
+          file dist/atuin > dist/file.txt
 
       - name: Upload artifact
         uses: actions/upload-artifact@v6

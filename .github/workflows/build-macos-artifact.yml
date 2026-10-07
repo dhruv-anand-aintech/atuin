@@ -40,11 +40,16 @@ jobs:
 
       - name: Install Zig
         uses: goto-bus-stop/setup-zig@v2
+        with:
+          version: 0.13.0
 
       - name: Install cargo-zigbuild
         uses: taiki-e/install-action@v2
         with:
-          tool: cargo-zigbuild
+          # 0.23 emits duplicate dylib load commands for darwin targets, which
+          # modern dyld rejects at startup (rust-cross/cargo-zigbuild#457).
+          # 0.21 still de-duplicates them.
+          tool: cargo-zigbuild@0.21.8
 
       - name: Cache cargo
         uses: actions/cache@v4
@@ -68,6 +73,42 @@ jobs:
 
       - name: Build atuin CLI
         run: cargo zigbuild -p atuin --locked --release --target aarch64-apple-darwin
+
+      - name: Verify no duplicate linked libraries
+        run: |
+          python3 - <<'PY'
+          import struct, sys
+          from collections import Counter
+
+          path = "target/aarch64-apple-darwin/release/atuin"
+          data = open(path, "rb").read()
+          magic = struct.unpack_from("<I", data, 0)[0]
+          if magic == 0xCAFEBABE:
+              print("fat binary, skipping duplicate check")
+              sys.exit(0)
+          if magic != 0xFEEDFACF:
+              print(f"unexpected Mach-O magic {magic:#x}")
+              sys.exit(1)
+
+          ncmds = struct.unpack_from("<I", data, 16)[0]
+          dylib_cmds = {0xC, 0x80000018, 0x8000001F, 0x80000023}
+          off = 32
+          names = []
+          for _ in range(ncmds):
+              cmd, cmdsize = struct.unpack_from("<II", data, off)
+              if cmd in dylib_cmds:
+                  name_off = struct.unpack_from("<I", data, off + 8)[0]
+                  end = data.index(b"\x00", off + name_off)
+                  names.append(data[off + name_off : end].decode())
+              off += cmdsize
+
+          dupes = [n for n, c in Counter(names).items() if c > 1]
+          print(f"{len(names)} linked dylibs")
+          if dupes:
+              print("duplicate linked dylibs:", dupes)
+              sys.exit(1)
+          print("no duplicate linked dylibs")
+          PY
 
       - name: Package binary
         run: |

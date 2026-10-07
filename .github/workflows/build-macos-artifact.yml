@@ -18,10 +18,17 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  # rustc 1.95.0 emits a malformed Mach-O when stripping (dyld:
+  # "mis-aligned LINKEDIT string pool"), which breaks the produced binary.
+  # Keep debuginfo; the artifact is for personal use, size does not matter.
+  CARGO_PROFILE_RELEASE_STRIP: "false"
 
 jobs:
   build-macos-aarch64:
-    runs-on: macos-latest
+    # Cross-compile from a plentiful Linux runner instead of waiting on scarce
+    # macOS arm64 hosted runners ("job was not acquired by Runner of type
+    # hosted"). cargo-zigbuild needs a macOS SDK for the darwin frameworks.
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
 
@@ -29,16 +36,50 @@ jobs:
         uses: dtolnay/rust-toolchain@master
         with:
           toolchain: 1.95.0
+          targets: aarch64-apple-darwin
+
+      - name: Install Zig
+        uses: goto-bus-stop/setup-zig@v2
+
+      - name: Install cargo-zigbuild
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-zigbuild
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: zigbuild-aarch64-apple-darwin-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            zigbuild-aarch64-apple-darwin-
+
+      - name: Download macOS SDK
+        run: |
+          curl -fsSL -o /tmp/MacOSX14.5.sdk.tar.xz \
+            https://github.com/joseluisq/macosx-sdks/releases/download/14.5/MacOSX14.5.sdk.tar.xz
+          mkdir -p "$RUNNER_TEMP/macos-sdk"
+          tar -xf /tmp/MacOSX14.5.sdk.tar.xz -C "$RUNNER_TEMP/macos-sdk"
+          echo "SDKROOT=$RUNNER_TEMP/macos-sdk/MacOSX14.5.sdk" >> "$GITHUB_ENV"
+          ls "$RUNNER_TEMP/macos-sdk"
 
       - name: Build atuin CLI
-        run: cargo build -p atuin --locked --release
+        run: cargo zigbuild -p atuin --locked --release --target aarch64-apple-darwin
 
       - name: Package binary
         run: |
           mkdir -p dist
-          cp target/release/atuin dist/atuin
+          cp target/aarch64-apple-darwin/release/atuin dist/atuin
           shasum -a 256 dist/atuin > dist/atuin.sha256
-          ./dist/atuin --version > dist/version.txt
+          # The binary is for macOS, so it cannot be executed on this runner.
+          ./dist/atuin --version > dist/version.txt 2>/dev/null \
+            || printf 'atuin (cross-compiled aarch64-apple-darwin, %s)\n' \
+                 "$(git rev-parse --short HEAD)" > dist/version.txt
+          file dist/atuin
+          ls -la dist
 
       - name: Upload artifact
         uses: actions/upload-artifact@v6
